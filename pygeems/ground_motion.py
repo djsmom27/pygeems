@@ -173,6 +173,189 @@ def calc_aris_intensity_aea16(
     return ln_arias_int, ln_std
 
 
+@dist_lognorm
+def calc_duration_afs16(
+    kind: str,
+    mag: float,
+    dist_rup: float,
+    v_s30: float,
+    mech: str = "strike-slip",
+    z1: float | None = None,
+    **kwargs,
+):
+    """Significant duration from Afshari and Stewart (2016).
+
+    Parameters
+    ----------
+    kind: duration parameter, one of 'd5-75', 'd5-95', 'd20-80', the time
+        intervals over which 5-75%, 5-95%, or 20-80% of the Arias intensity
+        accumulates.
+    mag: moment magnitude.
+    dist_rup: closest distance to the rupture in [km].
+    v_s30: time-averaged shear-wave velocity in the top 30 m in [m/s].
+    mech: focal mechanism, one of 'normal', 'reverse', 'strike-slip',
+        'unknown'.
+    z1: depth to the 1.0 km/s shear-wave isosurface in [m]. The basin-depth
+        term of the published model is not implemented in this version, so
+        supplying a value raises NotImplementedError rather than silently
+        ignoring it.
+
+    Returns
+    -------
+    ret : float
+        Median significant duration in [sec], or (ln median, ln standard
+        deviation) when ``stats=True`` is passed.
+
+    Notes
+    -----
+    The model is additive in arithmetic units: the median duration is
+    ``(source + path) * exp(site)``, where the source duration is the
+    inverse corner frequency from the Brune model with a magnitude-dependent
+    stress-drop index, the path duration is piecewise linear in rupture
+    distance with breaks at 10 and 50 km, and the site term scales with
+    ``v_s30`` up to a limiting velocity of 600 m/s. Coefficients are from
+    Tables 1-3 of Afshari and Stewart (2016). The basin-depth term
+    (their Eq. 9) is omitted; see the ``z1`` parameter note above.
+    """
+    if z1 is not None:
+        raise NotImplementedError(
+            "The basin-depth term of Afshari and Stewart (2016) is not "
+            "implemented; pass z1=None to use the v_s30 site term only."
+        )
+    check_options(kind, ["d5-75", "d5-95", "d20-80"], "kind")
+    check_options(mech, ["normal", "reverse", "strike-slip", "unknown"], "mech")
+    check_bounds(mag, 3.0, 8.0, "mag")
+    check_bounds(dist_rup, 0, 300, "dist_rup")
+    check_bounds(v_s30, 150, 1500, "v_s30")
+
+    # Coefficients from Tables 1-3 of Afshari and Stewart (2016).
+    # M1, M2: magnitude breaks; b0: source duration at M1 in [sec];
+    # b1: stress-drop index at M* = 6; b2, b3: stress-drop slopes below
+    # and above M2; c1-c3: path slopes in [sec/km]; c4: v_s30 slope;
+    # v_ref: reference velocity in [m/s]; tau, phi: between- and
+    # within-event standard deviations at low and high magnitude.
+    C = {
+        "d5-75": {
+            "m1": 5.35,
+            "m2": 7.15,
+            "b0": {
+                "normal": 1.603,
+                "reverse": 0.7806,
+                "strike-slip": 1.279,
+                "unknown": 1.280,
+            },
+            "b1": {
+                "normal": 4.992,
+                "reverse": 7.061,
+                "strike-slip": 5.578,
+                "unknown": 5.576,
+            },
+            "b2": 0.9011,
+            "b3": -1.684,
+            "c1": 0.1159,
+            "c2": 0.1065,
+            "c3": 0.0682,
+            "c4": -0.2246,
+            "v_ref": 368.2,
+            "tau": (0.31, 0.25),
+            "phi": (0.54, 0.41),
+        },
+        "d5-95": {
+            "m1": 5.2,
+            "m2": 7.4,
+            "b0": {
+                "normal": 2.541,
+                "reverse": 1.612,
+                "strike-slip": 2.302,
+                "unknown": 2.182,
+            },
+            "b1": {
+                "normal": 3.170,
+                "reverse": 4.536,
+                "strike-slip": 3.467,
+                "unknown": 3.628,
+            },
+            "b2": 0.9443,
+            "b3": -3.911,
+            "c1": 0.3165,
+            "c2": 0.2539,
+            "c3": 0.0932,
+            "c4": -0.3183,
+            "v_ref": 369.9,
+            "tau": (0.24, 0.23),
+            "phi": (0.47, 0.35),
+        },
+        "d20-80": {
+            "m1": 5.2,
+            "m2": 7.4,
+            "b0": {
+                "normal": 1.413,
+                "reverse": 0.7754,
+                "strike-slip": 0.8833,
+                "unknown": 0.8851,
+            },
+            "b1": {
+                "normal": 4.778,
+                "reverse": 6.579,
+                "strike-slip": 6.188,
+                "unknown": 6.182,
+            },
+            "b2": 0.7414,
+            "b3": -3.164,
+            "c1": 0.0646,
+            "c2": 0.0865,
+            "c3": 0.0373,
+            "c4": -0.4237,
+            "v_ref": 369.6,
+            "tau": (0.30, 0.22),
+            "phi": (0.62, 0.45),
+        },
+    }[kind]
+
+    # Source duration: constant below M1, otherwise the inverse corner
+    # frequency for a Brune source with shear-wave velocity 3.2 km/s.
+    if mag <= C["m1"]:
+        source = C["b0"][mech]
+    else:
+        m0 = 10 ** (1.5 * mag + 16.05)
+        ln_stress = C["b1"][mech] + C["b2"] * (min(mag, C["m2"]) - 6.0)
+        if mag > C["m2"]:
+            ln_stress += C["b3"] * (mag - C["m2"])
+        corner_freq = 4.9e6 * 3.2 * (np.exp(ln_stress) / m0) ** (1 / 3)
+        source = 1 / corner_freq
+
+    # Path duration: piecewise linear, breaks at 10 and 50 km.
+    if dist_rup <= 10:
+        path = C["c1"] * dist_rup
+    elif dist_rup <= 50:
+        path = C["c1"] * 10 + C["c2"] * (dist_rup - 10)
+    else:
+        path = C["c1"] * 10 + C["c2"] * 40 + C["c3"] * (dist_rup - 50)
+
+    # Site term: v_s30 scaling only, capped at 600 m/s.
+    site = C["c4"] * np.log(min(v_s30, 600) / C["v_ref"])
+
+    ln_mean = np.log(source + path) + site
+
+    # Standard deviation: between-event term interpolates over
+    # 6.25-6.5, within-event over 5.5-5.75.
+    tau1, tau2 = C["tau"]
+    phi1, phi2 = C["phi"]
+    tau = (
+        tau1
+        if mag <= 6.25
+        else tau2 if mag >= 6.5 else tau1 + (tau2 - tau1) * (mag - 6.25) / 0.25
+    )
+    phi = (
+        phi1
+        if mag <= 5.5
+        else phi2 if mag >= 5.75 else phi1 + (phi2 - phi1) * (mag - 5.5) / 0.25
+    )
+    ln_std = np.sqrt(tau**2 + phi**2)
+
+    return ln_mean, ln_std
+
+
 class TimeSeries:
     def __init__(self, time_step, accels, info=""):
         self._time_step = time_step
